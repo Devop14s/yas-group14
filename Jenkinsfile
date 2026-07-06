@@ -9,6 +9,14 @@ pipeline {
     environment {
         MAVEN_OPTS = '-Dmaven.test.failure.ignore=false'
         SONARQUBE_ENV = 'SonarQube' // SonarQube server name configured in Jenkins
+        DOCKERHUB_NAMESPACE = 'luongtrz'
+    }
+
+    triggers {
+        // GitHub webhooks trigger immediately when reachable. Polling is the
+        // reliable fallback for this on-premise Jenkins behind WSL/NAT.
+        githubPush()
+        pollSCM('H/5 * * * *')
     }
 
     options {
@@ -24,6 +32,15 @@ pipeline {
         stage('Detect Changes') {
             steps {
                 script {
+                    env.IMAGE_TAG = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+                    env.SOURCE_COMMIT = sh(
+                        script: 'git rev-parse HEAD',
+                        returnStdout: true
+                    ).trim()
+
                     // Services that have unit tests and can be built
                     def allServices = [
                         'media', 'product', 'cart', 'order', 'customer',
@@ -75,6 +92,7 @@ pipeline {
                         echo "No service changes detected. Skipping build."
                     } else {
                         echo "Changed services: ${changedServices.join(', ')}"
+                        echo "Immutable image tag: ${env.IMAGE_TAG}"
                     }
                 }
             }
@@ -132,7 +150,51 @@ pipeline {
         }
 
         // ============================================================
-        // PHASE 4: CODE QUALITY - Checkstyle + SonarQube
+        // PHASE 4: IMAGE - tag every changed service by commit id
+        // ============================================================
+        stage('Build and Push Commit Images') {
+            when {
+                expression { return !changedServices.isEmpty() }
+            }
+            steps {
+                script {
+                    sh 'mkdir -p work && : > work/ci-image-evidence.txt'
+                    withCredentials([usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh 'echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin'
+
+                        for (svc in changedServices) {
+                            def image = "${env.DOCKERHUB_NAMESPACE}/yas-${svc}:${env.IMAGE_TAG}"
+                            sh """
+                                docker build \
+                                  --label org.opencontainers.image.revision=${env.SOURCE_COMMIT} \
+                                  -t ${image} \
+                                  ${svc}
+                                docker push ${image}
+                                printf '%s commit=%s\n' '${image}' '${env.SOURCE_COMMIT}' \
+                                  >> work/ci-image-evidence.txt
+                            """
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    sh 'docker logout || true'
+                    archiveArtifacts(
+                        artifacts: 'work/ci-image-evidence.txt',
+                        allowEmptyArchive: false,
+                        fingerprint: true
+                    )
+                }
+            }
+        }
+
+        // ============================================================
+        // PHASE 5: CODE QUALITY - Checkstyle + SonarQube
         // ============================================================
         stage('Code Quality') {
             when {
@@ -182,7 +244,7 @@ pipeline {
         }
 
         // ============================================================
-        // PHASE 5: SECURITY SCAN - Gitleaks + Snyk
+        // PHASE 6: SECURITY SCAN - Gitleaks + Snyk
         // ============================================================
         stage('Security Scan') {
             when {
