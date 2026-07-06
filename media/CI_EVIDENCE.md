@@ -6,3 +6,6 @@ tagged with the branch head commit ID.
 
 The follow-up commit verifies that an already-discovered branch is rebuilt
 automatically by the GitHub push trigger or its SCM polling fallback.
+
+The final evidence commit is intentionally media-scoped so the successful CI
+run must build and push `yas-media:<commit-short-sha>`.
